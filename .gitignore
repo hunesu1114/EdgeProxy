@@ -1,0 +1,16 @@
+# 로컬 검증용 자체 서명 인증서
+.local-certs/
+
+# 운영 인증서는 서버의 /etc/edge/certs 에 있다. 저장소에 절대 두지 않는다.
+*.pem
+*.key
+*.crt
+
+.env
+.env.*
+!.env*.example
+
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
