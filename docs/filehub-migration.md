@@ -96,8 +96,13 @@ docker compose exec proxy nginx -t
 
 ## 5. 확인
 
+> edge 는 **SNI**(TLS 핸드셰이크에 실려 오는 도메인)로 server 블록을 고른다.
+> `-H "Host:"` 만 붙여 `https://localhost` 로 접속하면 SNI 는 `localhost` 로 나가
+> 기본 서버에 걸리고, HTTP/2 는 그 불일치를 거부해 `PROTOCOL_ERROR` 를 낸다.
+> **서비스가 멀쩡해도 그렇다.** `--resolve` 로 도메인을 그대로 쓰되 접속만 루프백으로 돌린다.
+
 ```bash
-curl -fsSk -H "Host: filehub-khs.duckdns.org" https://localhost/ >/dev/null && echo "FileHub OK"
+curl -fsSk --resolve filehub-khs.duckdns.org:443:127.0.0.1 https://filehub-khs.duckdns.org/ >/dev/null && echo "FileHub OK"
 ```
 
 브라우저에서 `https://filehub-khs.duckdns.org` 도 확인한다.
