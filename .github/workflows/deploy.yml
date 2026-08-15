@@ -76,6 +76,29 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Secret 이 비어 있으면 ssh-action 은 "missing server host" 라고만 한다.
+      # 어느 값이 없는지 안 알려줘서, 여기서 먼저 이름을 대고 멈춘다.
+      - name: Secrets 확인
+        env:
+          SERVER_HOST: ${{ secrets.SERVER_HOST }}
+          SERVER_USER: ${{ secrets.SERVER_USER }}
+          SERVER_SSH_KEY: ${{ secrets.SERVER_SSH_KEY }}
+        run: |
+          missing=""
+          [ -n "$SERVER_HOST" ]    || missing="$missing SERVER_HOST"
+          [ -n "$SERVER_USER" ]    || missing="$missing SERVER_USER"
+          [ -n "$SERVER_SSH_KEY" ] || missing="$missing SERVER_SSH_KEY"
+
+          if [ -n "$missing" ]; then
+            echo "::error::이 저장소에 등록되지 않은 Secret:$missing"
+            echo ""
+            echo "Settings > Secrets and variables > Actions 에서 등록한다."
+            echo "Secrets 탭이다. 옆의 Variables 탭에 넣으면 여기서 안 보인다."
+            echo "Secret 은 저장소마다 따로다. 다른 저장소에 넣은 값은 넘어오지 않는다."
+            exit 1
+          fi
+          echo "OK (SERVER_PORT 는 없으면 22)"
+
       # 파일이 여러 개라 tar 로 묶어 base64 로 실어 보낸다.
       # scp-action 은 SSH 를 두 번 연결하는데, 짧은 간격의 두 번째 접속이
       # 공유기 보안 기능에 차단돼 timeout 이 난다. 연결을 1회로 줄인다.
