@@ -1,0 +1,171 @@
+name: CI/CD
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+    branches: [master, main]
+  workflow_dispatch:
+
+# 배포가 겹치면 서버에서 설정이 뒤섞인다. 앞선 실행이 끝날 때까지 기다린다.
+concurrency:
+  group: edge-deploy
+  cancel-in-progress: false
+
+jobs:
+  # ───────────────────────────────────────
+  # 1단계: 설정 검증 (PR 포함 항상 실행)
+  # ───────────────────────────────────────
+  #
+  # edge 는 이 서버의 모든 사이트가 지나는 길목이다.
+  # 설정이 깨진 채로 컨테이너가 재생성되면 전부 동시에 죽으므로,
+  # 서버에 닿기 전에 여기서 먼저 걸러낸다.
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # nginx -t 는 인증서 파일이 실제로 있어야 통과한다.
+      # 검증 전용 자체 서명 인증서를 만들어 경로만 채운다.
+      - name: 검증용 인증서 생성
+        run: |
+          for name in default filehub boram; do
+            mkdir -p certs/$name
+            openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+              -keyout certs/$name/privkey.pem \
+              -out    certs/$name/fullchain.pem \
+              -subj "/CN=localhost" 2>/dev/null
+          done
+
+      - name: nginx 설정 검사
+        run: |
+          docker run --rm \
+            -v "$PWD/conf.d:/etc/nginx/conf.d:ro" \
+            -v "$PWD/certs:/etc/edge/certs:ro" \
+            nginx:1.29-alpine nginx -t
+
+      - name: compose 파일 검사
+        run: docker compose -f docker-compose.yml config -q
+
+      # 프록시가 뒤쪽 앱을 고정 이름으로 참조하면, 그 앱이 없을 때
+      # edge 자체가 기동하지 못해 다른 사이트까지 함께 죽는다.
+      # resolver + 변수 방식이 유지되고 있는지 확인한다.
+      - name: upstream 이 변수로 되어 있는지
+        run: |
+          for f in conf.d/boram.conf conf.d/filehub.conf; do
+            if grep -qE 'proxy_pass http://[a-z-]+:' "$f"; then
+              echo "::error file=$f::upstream 이 고정 이름이다. resolver + 변수 방식이어야 한다"
+              exit 1
+            fi
+          done
+          echo "OK"
+
+  # ───────────────────────────────────────
+  # 2단계: 배포
+  # ───────────────────────────────────────
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: validate
+    if: github.event_name != 'pull_request'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 파일이 여러 개라 tar 로 묶어 base64 로 실어 보낸다.
+      # scp-action 은 SSH 를 두 번 연결하는데, 짧은 간격의 두 번째 접속이
+      # 공유기 보안 기능에 차단돼 timeout 이 난다. 연결을 1회로 줄인다.
+      - name: 설정 묶어서 인코딩
+        id: pack
+        run: echo "b64=$(tar czf - docker-compose.yml conf.d | base64 -w0)" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy over a single SSH session
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          BUNDLE_B64: ${{ steps.pack.outputs.b64 }}
+        with:
+          host: ${{ secrets.SERVER_HOST }}
+          username: ${{ secrets.SERVER_USER }}
+          key: ${{ secrets.SERVER_SSH_KEY }}
+          port: ${{ secrets.SERVER_PORT || '22' }}
+          envs: BUNDLE_B64
+          script: |
+            set -e
+            mkdir -p ~/edge
+            cd ~/edge
+
+            # ── 새 설정을 별도 위치에 먼저 푼다 ──
+            # 바로 덮어쓰면, 검증에 실패했을 때 이미 깨진 파일이 자리를 잡는다.
+            # 그 상태에서 컨테이너가 재시작되면 모든 사이트가 죽는다.
+            rm -rf ~/edge.new && mkdir -p ~/edge.new
+            printf %s "$BUNDLE_B64" | base64 -d | tar xzf - -C ~/edge.new
+
+            # ── 실제 인증서로 검증 ──
+            # 일회용 컨테이너에서 확인하므로 돌고 있는 edge 에는 영향이 없다.
+            echo "새 설정 검증..."
+            docker run --rm \
+              -v ~/edge.new/conf.d:/etc/nginx/conf.d:ro \
+              -v /etc/edge/certs:/etc/edge/certs:ro \
+              nginx:1.29-alpine nginx -t
+
+            # ── 검증을 통과했으니 자리에 놓는다 ──
+            #
+            # conf.d 디렉터리 자체는 바인드 마운트 대상이라 지웠다 다시 만들면 안 된다.
+            # 돌고 있는 컨테이너는 예전 디렉터리를 계속 보게 된다.
+            # 안의 파일만 바꾼다.
+            mkdir -p ~/edge/conf.d
+            cp ~/edge.new/conf.d/*.conf ~/edge/conf.d/
+
+            # 저장소에서 삭제된 설정은 서버에서도 지운다.
+            # 안 그러면 지운 도메인이 계속 살아 있는다.
+            # (먼저 복사한 뒤에 지우므로 디렉터리가 비는 순간이 없다)
+            for f in ~/edge/conf.d/*.conf; do
+              [ -f ~/edge.new/conf.d/"$(basename "$f")" ] || { echo "제거: $(basename "$f")"; rm -f "$f"; }
+            done
+
+            cp ~/edge.new/docker-compose.yml ~/edge/docker-compose.yml
+            rm -rf ~/edge.new
+
+            docker network inspect edge-net >/dev/null 2>&1 || docker network create edge-net
+
+            # compose 가 바뀐 경우에만 컨테이너가 재생성된다. 안 바뀌면 아무 일도 없다.
+            docker compose up -d
+
+            # 방금 재생성됐다면 아직 안 올라왔을 수 있다.
+            for i in $(seq 1 10); do
+              docker compose exec -T proxy true 2>/dev/null && break
+              sleep 2
+            done
+
+            # ── 반영 ──
+            # restart 가 아니라 reload 를 쓴다. reload 는 새 설정이 잘못되면
+            # 예전 설정으로 계속 서비스하지만, restart 는 그대로 죽는다.
+            docker compose exec -T proxy nginx -t
+            docker compose exec -T proxy nginx -s reload
+            echo "설정 반영 완료"
+
+            # ── 확인 ──
+            # edge 는 SNI 로 server 블록을 고르므로 --resolve 로 도메인을 그대로 쓴다.
+            # -H "Host:" 만 쓰면 SNI 가 localhost 로 나가 기본 서버에 걸린다.
+            fail=0
+            for domain in filehub-khs.duckdns.org boram-khs.duckdns.org; do
+              code=$(curl -sk -o /dev/null -w "%{http_code}" \
+                --resolve "$domain:443:127.0.0.1" "https://$domain/" || echo 000)
+
+              case "$code" in
+                # 502 는 뒤쪽 앱이 아직 배포 전이라는 뜻이다. edge 잘못이 아니다.
+                2*|3*|502) echo "  $domain -> $code" ;;
+                *) echo "::error::$domain 이 $code 를 반환했다"; fail=1 ;;
+              esac
+            done
+
+            if [ "$fail" = "1" ]; then
+              docker compose logs proxy --tail 40
+              exit 1
+            fi
+
+            docker compose ps
