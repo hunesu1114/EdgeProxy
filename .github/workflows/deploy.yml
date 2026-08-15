@@ -153,8 +153,10 @@ jobs:
             # -H "Host:" 만 쓰면 SNI 가 localhost 로 나가 기본 서버에 걸린다.
             fail=0
             for domain in filehub-khs.duckdns.org boram-khs.duckdns.org; do
+              # 연결 자체가 실패하면 curl 이 000 을 찍는다(-f 를 안 쓰므로 종료코드는 무시).
               code=$(curl -sk -o /dev/null -w "%{http_code}" \
-                --resolve "$domain:443:127.0.0.1" "https://$domain/" || echo 000)
+                --connect-timeout 5 --max-time 15 \
+                --resolve "$domain:443:127.0.0.1" "https://$domain/") || true
 
               case "$code" in
                 # 502 는 뒤쪽 앱이 아직 배포 전이라는 뜻이다. edge 잘못이 아니다.
