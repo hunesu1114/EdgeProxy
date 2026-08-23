@@ -32,7 +32,11 @@ jobs:
       # 검증 전용 자체 서명 인증서를 만들어 경로만 채운다.
       - name: 검증용 인증서 생성
         run: |
-          for name in default filehub boram; do
+          # 목록을 손으로 적으면 도메인을 추가할 때 반드시 빠뜨린다.
+          # conf.d 가 실제로 참조하는 경로에서 이름을 뽑아 그대로 만든다.
+          names=$(grep -rhoE '/etc/edge/certs/[a-zA-Z0-9_-]+/' conf.d | cut -d/ -f5 | sort -u)
+          echo "인증서 자리: $(echo $names)"
+          for name in $names; do
             mkdir -p certs/$name
             openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
               -keyout certs/$name/privkey.pem \
@@ -55,8 +59,13 @@ jobs:
       # resolver + 변수 방식이 유지되고 있는지 확인한다.
       - name: upstream 이 변수로 되어 있는지
         run: |
-          for f in conf.d/boram.conf conf.d/filehub.conf; do
-            if grep -qE 'proxy_pass http://[a-z-]+:' "$f"; then
+          # 새 도메인 파일이 검사에서 조용히 빠지지 않도록 conf.d 전체를 훑는다.
+          # 00-default.conf 는 프록시하지 않으므로 제외한다.
+          for f in conf.d/*.conf; do
+            # Actions 는 bash -e 로 돌린다. [ ] && continue 는 조건이 거짓일 때
+            # 종료코드 1 이 되어 스텝 전체가 실패하므로 case 로 거른다.
+            case "$(basename "$f")" in 00-default.conf) continue ;; esac
+            if grep -qE 'proxy_pass https?://[a-zA-Z0-9_-]+:' "$f"; then
               echo "::error file=$f::upstream 이 고정 이름이다. resolver + 변수 방식이어야 한다"
               exit 1
             fi
@@ -174,8 +183,13 @@ jobs:
             # ── 확인 ──
             # edge 는 SNI 로 server 블록을 고르므로 --resolve 로 도메인을 그대로 쓴다.
             # -H "Host:" 만 쓰면 SNI 가 localhost 로 나가 기본 서버에 걸린다.
+            # 확인할 도메인도 설정에서 뽑는다. 손으로 적어두면 새로 추가한
+            # 도메인이 확인 없이 통과해 버린다. `_`(기본 서버)는 제외한다.
+            domains=$(grep -rhE '^[[:space:]]*server_name[[:space:]]' ~/edge/conf.d/*.conf \
+                      | awk '{print $2}' | tr -d ';' | grep -v '^_$' | sort -u)
+
             fail=0
-            for domain in filehub-khs.duckdns.org boram-khs.duckdns.org; do
+            for domain in $domains; do
               # 연결 자체가 실패하면 curl 이 000 을 찍는다(-f 를 안 쓰므로 종료코드는 무시).
               code=$(curl -sk -o /dev/null -w "%{http_code}" \
                 --connect-timeout 5 --max-time 15 \
